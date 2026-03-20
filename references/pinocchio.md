@@ -250,9 +250,10 @@ invoke(&ix, &[account])?;
 
 | Method | Use When | Notes |
 |---|---|---|
-| `bytemuck` | Fixed-size structs | Zero-copy, fastest |
-| `borsh` | Variable-size data | Allocates; use only when needed |
-| Manual parsing | Maximum control / simple types | Safe with explicit length checks |
+| `bytemuck` | Fixed-size structs (account state) | Zero-copy, fastest; preferred for on-chain account layout |
+| `wincode` | Variable-size instruction data; foreign type adaptation | Anza-built, bincode-compatible, in-place; no intermediate buffers |
+| `borsh` | Variable-size data where borsh compatibility is required | Allocates; use only when the wire format must be Borsh |
+| Manual parsing | Maximum control / simple scalar types | Safe with explicit length checks |
 
 **Manual parsing example (always bounds-check first):**
 ```rust
@@ -261,6 +262,162 @@ pub fn parse_u64(data: &[u8]) -> Result<u64, ProgramError> {
     Ok(u64::from_le_bytes(data[..8].try_into().unwrap()))
 }
 ```
+
+---
+
+## 7a. WINCODE — IN-PLACE SERIALIZATION / DESERIALIZATION
+
+`wincode` is Anza's fast, bincode-compatible serializer that eliminates intermediate
+staging buffers by writing directly into final memory destinations. It is the natural
+complement to Pinocchio's zero-copy philosophy for **instruction data** and any
+variable-size payloads.
+
+> **Compatibility:** `wincode` produces the same bytes as `bincode` (default config)
+> for all covered shapes — clients using `bincode` can talk to programs using `wincode`
+> for deserialization, and vice versa.
+
+### Cargo setup
+
+```toml
+[dependencies]
+wincode = { version = "0.4", features = ["derive"] }
+```
+
+The `derive` feature enables the `SchemaWrite` and `SchemaRead` proc-macro derives.
+
+### Basic usage
+
+```rust
+use wincode::{SchemaWrite, SchemaRead};
+
+#[derive(SchemaWrite, SchemaRead)]
+pub struct DepositArgs {
+    pub amount:   u64,
+    pub deadline: i64,
+}
+
+// --- Deserializing instruction data inside a Pinocchio handler ---
+pub fn deposit(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    // Always bounds-check before deserializing
+    let args: DepositArgs = wincode::deserialize(data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+
+    // Use args.amount, args.deadline ...
+    Ok(())
+}
+
+// --- Serializing a response / off-chain client ---
+let args = DepositArgs { amount: 1_000_000, deadline: 1_700_000_000 };
+let bytes = wincode::serialize(&args).unwrap();
+```
+
+### Zero-copy deserialization
+
+For padding-free `#[repr(C)]` structs, `wincode` can deserialize **in-place**
+(zero allocations, zero copies). This is the highest-performance path and pairs
+perfectly with Pinocchio's ethos.
+
+**Rules for zero-copy eligibility:**
+- Struct must be `#[repr(C)]`
+- No implicit padding (reorder fields or add an explicit `_padding` field — same
+  rule as `bytemuck`)
+- No tuples (Rust does not guarantee tuple layout)
+
+```rust
+use wincode::{SchemaWrite, SchemaRead, ZeroCopy};
+
+// Reorder fields to eliminate implicit padding (u32 first, then u16, then u8s)
+#[repr(C)]
+#[derive(SchemaWrite, SchemaRead)]
+pub struct SwapArgs {
+    pub min_out:   u64,   // 8 bytes
+    pub max_in:    u64,   // 8 bytes
+    pub deadline:  i64,   // 8 bytes
+    pub slippage:  u16,   // 2 bytes
+    pub side:      u8,    // 1 byte
+    pub _padding:  u8,    // explicit padding — aligns to 8 bytes total
+}
+
+pub fn swap(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    // Zero-copy: no heap allocation, reads directly from the incoming byte slice
+    let args: &SwapArgs = wincode::config::ZeroCopy::deserialize(data)
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+
+    // args is a reference into `data` — no copy made
+    let _ = args.min_out;
+    Ok(())
+}
+```
+
+### Adapting foreign / third-party types
+
+When a third-party type uses `serde` and visits bytes element-by-element,
+`wincode` can wrap it with `Pod<T>` to read the whole field in one pass —
+without changing the wire format:
+
+```rust
+use wincode::{SchemaWrite, SchemaRead, Pod};
+
+// Suppose `ExternalPubkey` is defined in another crate with a slow serde impl
+#[derive(SchemaWrite, SchemaRead)]
+#[wincode(from = "ExternalInstruction")]
+pub struct MyInstruction {
+    pub recipient: Pod<ExternalPubkey>,  // reads 32 bytes in one pass
+    pub amount:    u64,
+}
+```
+
+### Pluggable length encoding (short-vec / compact-u16)
+
+For instruction payloads that embed Solana's compact-u16 length prefix
+(used in transaction wire format), enable the `solana-short-vec` feature
+and switch the `SeqLen` encoder:
+
+```toml
+[dependencies]
+wincode = { version = "0.4", features = ["derive", "solana-short-vec"] }
+```
+
+```rust
+use wincode::{SchemaWrite, SchemaRead};
+use wincode::config::ShortVec; // compact-u16 length prefix
+
+#[derive(SchemaWrite, SchemaRead)]
+pub struct InstructionWithAccounts {
+    #[wincode(seq_len = "ShortVec")]
+    pub accounts: Vec<[u8; 32]>,
+    pub data:     u64,
+}
+```
+
+### wincode vs. bytemuck — choosing the right tool
+
+| Concern | `bytemuck` | `wincode` |
+|---|---|---|
+| **Fixed-size on-chain account state** | ✅ Ideal | Possible but unnecessary overhead |
+| **Variable-size instruction data** | ❌ Not suitable | ✅ Ideal |
+| **Zero allocations** | ✅ Always | ✅ With `ZeroCopy` config |
+| **Wire format** | Raw memory layout | bincode (widely supported) |
+| **Derive macros** | `Pod` + `Zeroable` | `SchemaWrite` + `SchemaRead` |
+| **Foreign type adaptation** | ❌ Cannot | ✅ Via `Pod<T>` wrapper |
+| **Padding required** | ✅ Yes — explicit `_padding` | ✅ Yes for zero-copy — same rule |
+
+**Rule of thumb:**
+- `bytemuck` for **account data** (fixed-size, on-chain state).
+- `wincode` for **instruction data** and any variable-size or dynamic payloads.
+- Never mix both in the same struct — pick one ownership boundary.
+
+### Security notes specific to wincode
+
+- **Always validate deserialized values** — `wincode` guarantees byte layout, not
+  business logic. Check amounts, deadlines, and enum variants after deserialization.
+- **Fail loudly on bad data** — map `wincode` errors to `ProgramError::InvalidInstructionData`,
+  never to a silent default. Never `unwrap()` inside an instruction handler.
+- **Do not trust client-supplied sizes** — `wincode` enforces a default max size for dynamic
+  structures to prevent allocation exhaustion; do not override this limit without a clear
+  upper bound justified in comments.
+- **Padding field must be zeroed** — for zero-copy structs, initialize `_padding` to `[0u8; N]`
+  on construction; stale bytes in padding fields can leak information across instructions.
 
 ---
 
@@ -302,6 +459,10 @@ All rules from `shared-base.md` apply. Additional Pinocchio-specific checks:
 - [ ] Validation struct uses `TryFrom` or equivalent — no inline ad-hoc checks
 - [ ] `overflow-checks = true` in `[profile.release]`
 - [ ] No `unwrap()` / `expect()` in instruction handlers
+- [ ] **[wincode]** `wincode` errors mapped to `ProgramError::InvalidInstructionData` — never `unwrap()`
+- [ ] **[wincode]** Zero-copy structs use `#[repr(C)]` with explicit `_padding` zeroed on construction
+- [ ] **[wincode]** Deserialized instruction values range-checked before use (amounts > 0, deadlines in future, etc.)
+- [ ] **[wincode]** Max-size limit for dynamic `Vec` fields not overridden without a documented upper bound
 
 ---
 
@@ -314,3 +475,5 @@ Pinocchio uses `cargo build-sbf` — the same toolchain as native Rust. See `nat
 - **`cargo build-sbf` not found:** Install Solana CLI and add to PATH
 - **LiteSVM on GLIBC <2.38:** Use `solana-bankrun` instead
 - **Shank IDL generation:** `shank idl -o idl.json -p src/lib.rs`. For client code, pipe through **Codama**.
+- **`wincode` proc-macro not found:** Ensure `features = ["derive"]` is set in `Cargo.toml` — the derive macros are feature-gated.
+- **`wincode` zero-copy fails to compile:** Struct has implicit padding — reorder fields or add explicit `_padding: [u8; N]` until the compiler stops complaining.
