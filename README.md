@@ -8,7 +8,7 @@ Built by a Solana security researcher, for Solana developers — so your code ar
 
 ## What Is This?
 
-**Safe Solana Builder** is a [Claude skill](https://www.anthropic.com/claude) — a structured system that loads Frank Castle's personal security knowledge directly into Claude's context before writing a single line of code.
+**Safe Solana Builder** is a security skill system you can load into AI coding workflows (Claude / Cursor) so Frank Castle's Solana security knowledge is applied before writing a single line of code.
 
 This is not a prompt. It is a layered reference architecture that forces Claude to:
 
@@ -123,10 +123,32 @@ The reference files cover:
 
 ## How to Install
 
+### Claude Setup
+
 1. Download `safe-solana-builder.skill` from the [Releases](../../releases) page
 2. In Claude.ai, go to **Settings → Skills**
 3. Upload the `.skill` file
 4. The skill activates automatically whenever you ask Claude to write a Solana program
+
+### Cursor IDE Support
+
+Cursor does not natively support `.skill` files, but the same system works by loading this repository as a **context rule** source.
+
+1. Clone the repository into Cursor's skills directory:
+
+```bash
+mkdir -p ~/.cursor/skills
+git clone https://github.com/Frankcastleauditor/safe-solana-builder.git ~/.cursor/skills/safe_solana_builder
+```
+
+2. Restart Cursor
+3. Reference the skill in your prompt:
+
+```txt
+Use the safe_solana_builder skill.
+
+Build a secure Solana program using Anchor.
+```
 
 ### Trigger Phrases
 
