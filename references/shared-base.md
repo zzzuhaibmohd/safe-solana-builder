@@ -332,6 +332,7 @@ Apply this curiosity to every design decision, not just during code review.
 - Validate token mints against a protocol allowlist or framework constraints (`mint::authority`, `mint::decimals`). An unconstrained mint allows arbitrary tokens to be injected into protocol flows.
 - Reject same-asset operations where distinct assets are required: `require!(input_mint != output_mint)`. Same-token operations can be exploited to manipulate fee accounting or pool invariants.
 - Enforce maximum sizes on variable-length inputs (messages, payloads, URIs) **before encoding**. Unbounded inputs cause compute overruns and silent log truncation.
+- For user-supplied metadata strings (for example name/symbol/URI), enforce protocol-level hygiene: non-empty required fields, explicit length bounds, and URI scheme allowlists. Do not rely only on downstream program/library maximums.
 - Verify protocol-owned addresses (fee recipients, config accounts) are the expected, constrained accounts **before updating them**. An unconstrained update enables fee redirection to attacker-controlled accounts.
 
 ---
@@ -584,6 +585,7 @@ require!(is_allowed_transition(current_state, next_state), ErrorCode::InvalidTra
 - If fees are deducted from user proceeds (or added to user cost), slippage validation must compare against net user outcome.
 - Checking only gross AMM output can pass while user receives less than `min_output`.
 - Keep API/event naming unambiguous (`gross_out`, `fee_amount`, `net_out`) so clients cannot misinterpret slippage-protected values.
+- Enforce slippage on the user's final net outcome, independent of how fees are collected. Separate fee transfers in the same instruction must be counted in that net result.
 
 ```rust
 // WRONG — checks gross
@@ -600,6 +602,7 @@ require!(net >= min_output);
 ### 27.2 Fee Base Must Match the Actual Swapped Amount
 - Charge fees on `source_amount_swapped` (actual consumed amount), not always on raw user input.
 - Partial fills and rounding make input and consumed amount diverge.
+- Use one canonical executed base amount for fee calculation, state/accounting updates, and events. Mixing requested and executed amounts across these paths causes silent economic drift.
 
 ```rust
 // WRONG — fees on raw input
@@ -634,6 +637,7 @@ treasury.lamports += fee;
 - If a curve has a completion threshold, clamp buys so sold amount never exceeds remaining capacity.
 - Overshoot can consume reserves needed for downstream actions (LP seeding, withdrawals, fees), causing reverts or underflows.
 - After applying any cap/clip to execution size, recompute outputs and re-check user slippage bounds against the **actual executed output**. Input-side limits alone do not protect output guarantees.
+- Completion-triggering trades must preserve completion-path solvency invariants (for example, reserves needed by settlement/fee logic). Do not allow a trade to mark terminal state if terminal handlers would immediately fail arithmetic or accounting checks.
 
 ```rust
 let sold_so_far = total_supply - remaining_reserves;
@@ -651,6 +655,7 @@ let effective_buy = std::cmp::min(requested_amount, remaining_capacity);
 ### 28.3 Validate Interdependent Config Fields Against Each Other, Not Stale State
 - For multi-field config updates, validate all new values against each other before writing state.
 - Writing one field early then validating against an unchanged sibling compares new-vs-old and can pass invalid configs.
+- Validate all new config values first, then write them together in one commit. Do not mix partial writes with validation.
 
 ```rust
 // WRONG — writes A, then validates stale B against new A
@@ -672,11 +677,15 @@ state.field_b = params.field_b;
 - `init` prevents re-initialization but does not ensure the intended party is the initializer.
 - If initializer is auto-assigned as admin with no identity check, anyone can frontrun and seize control.
 - Constrain expected admin identity, use atomic deploy+configure flows, or use two-step ownership acceptance.
+- First-writer-wins initialization of shared control state is a namespace-capture risk. If identity is not authenticated at creation, an arbitrary actor can permanently claim control over that state and all downstream flows that trust it.
+- If initialization is permissionless, decouple creator from privileged authority and require an explicit authority-acceptance step before privileged instructions become active.
 
 ### 29.2 User-Controlled Parameters That Affect Protocol Operations
 - Permissionless creation parameters that control protocol behavior can become griefing vectors if unbounded.
 - Extreme values can break fee collection, completion, cooldown semantics, or pricing.
 - Enforce bounded ranges at creation time.
+- Never let user-controlled parameters define release gates for assets or critical state transitions. Unlock conditions and time gates for restricted flows must be protocol-defined (or strictly bounded by protocol policy), not creator-defined.
+- User-chosen parameters must preserve state-machine reachability: while an entity is active, at least one valid forward path must remain. Reject parameter sets that can leave entities active but unable to progress.
 
 ```rust
 require!(params.virtual_offset >= MIN_OFFSET, "offset too low — breaks pricing");
@@ -707,6 +716,7 @@ require!(config.completion_fee < config.completion_threshold, "fee exceeds thres
 - Never overload a single `Option<T>` parameter to mean both "not provided" and "clear the stored optional field." This causes silent config corruption on unrelated updates.
 - For optional stored fields, use an explicit patch enum or separate `clear_*` flags so callers can update one field without mutating others.
 - Keep semantics uniform across all fields in the same admin update instruction.
+- Avoid full-struct rewrites for routine admin changes. Prefer granular setters or patch-style updates so one-field changes cannot silently overwrite unrelated live config.
 
 ```rust
 enum Patch<T> { Unchanged, Set(T), Clear }
@@ -720,6 +730,7 @@ enum Patch<T> { Unchanged, Set(T), Clear }
 - If admin/user-supplied withdraw amounts are not capped by tracked allocation, over-withdrawal can steal assets reserved for other flows.
 - Withdrawal eligibility must also require that all earmarked liabilities are settled (pending payouts, rebates, escrowed distributions, accrued obligations). Do not permit residual-balance extraction while reserved liability fields remain nonzero.
 - Reconcile liabilities to their intended recipients before any residual transfer.
+- For repeat/partial withdrawals, enforce cumulative caps (`already_withdrawn + requested <= allocated`) and update accounting in the same transaction. Never let balance transfers and internal reserve/liability tracking diverge.
 
 ```rust
 require!(withdraw_amount <= state.allocated_fee_balance, "exceeds allocated amount");
@@ -729,11 +740,16 @@ require!(state.pending_liabilities == 0, "unsettled obligations");
 ### 30.2 Zero Accounting Fields After Completing a Drain
 - After full settlement/completion drains, zero all reserve/balance accounting fields.
 - Stale nonzero values confuse indexers, break invariants, and create upgrade-time hazards.
+- If a flow intentionally leaves a reserved remainder, set accounting fields to the exact post-transfer remainder (not pre-drain values) and assert they match on-chain balances.
 
 ```rust
 // After draining all assets:
 state.sol_reserves = 0;
 state.token_reserves = 0;
+
+// If a reserved remainder intentionally stays:
+state.sol_reserves = 0;
+state.token_reserves = reserved_remainder;
 ```
 
 ---
@@ -757,6 +773,7 @@ state.token_reserves = 0;
 - If treasury is stored as raw `Pubkey` and ATA is derived at runtime, that address must be capable of owning token accounts.
 - Misconfigured treasury ownership can permanently lock withdrawn tokens.
 - Validate treasury compatibility at config-time or store explicit ATA addresses.
+- Treasury authorities must also be sweepable: there must be a valid signer path (wallet/multisig or program signer seeds) to move tokens out after receipt.
 
 ### 31.5 Token-2022 Mint Space Must Be Computed After All Extensions Are Declared
 - Account size must be computed from the final extension list.
