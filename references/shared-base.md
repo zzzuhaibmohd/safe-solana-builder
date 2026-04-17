@@ -164,6 +164,8 @@ CPI is the most complex attack surface in Solana. Every CPI is a trust boundary.
 - Always set the `owner` field of state accounts to your program's address. This is your primary access control for account data.
 - Never allow an account's data to be modified by a program that does not own it.
 - Never allow accounts to exceed **10 MiB** of data. Never allow total per-transaction resize to exceed **20 MiB**.
+- Size accounts using the serialized layout, not Rust in-memory layout. For Anchor accounts, prefer explicit `INIT_SPACE`/max-len-based sizing over `size_of::<T>()`.
+- `size_of::<T>()` is a memory-layout metric (alignment/padding/container metadata), not an on-chain encoding guarantee. Using it for account allocation can under-allocate after schema changes and cause init/write DoS.
 
 ### 6.2 Rent Exemption
 - **Always fund new accounts with at least two years' worth of rent** (the rent-exempt threshold).
@@ -229,6 +231,19 @@ Mixing legacy token functions with Token-2022 mints causes silent DoS.
 ### 9.3 Handle `remaining_accounts` With Full Rigor
 - If you iterate over `ctx.remaining_accounts`, apply the **same ownership, signer, and type checks** as you do for named accounts.
 - `remaining_accounts` is the easiest place to inject malicious accounts because developers assume they've already been validated.
+
+### 9.4 Never `unwrap()`/`expect()` on User-Controlled Option/Result Paths
+- Instruction handlers must return typed program errors, not panic. Avoid `unwrap()`/`expect()` on `Option`/`Result` values influenced by accounts or instruction data.
+- This is especially important for optional accounts (`Option<Account<...>>`): missing inputs should map to explicit custom errors via `ok_or(...)`.
+- Treat panic paths as reliability/security bugs because they produce opaque client failures and bypass normal error semantics.
+
+```rust
+let account_state = ctx
+    .accounts
+    .optional_account
+    .as_ref()
+    .ok_or(ErrorCode::MissingRequiredAccount)?;
+```
 
 ---
 
@@ -500,6 +515,8 @@ expiry_ts = Some(clock.unix_timestamp.checked_sub(grace_period).unwrap_or(0));
 - Any instruction that drains assets from a PDA (withdrawal, migration, completion) must zero matching accounting fields in the same transaction.
 - Stale reserves let later logic operate on phantom liquidity.
 - Prefer a post-drain invariant check (`actual == expected`) before finalizing state.
+- Any action that prices, redeems, or pays from tracked reserves must assert a **backing invariant** against real balances before execution. Status flags alone are not sufficient safety gates.
+- If liquidity is externalized/migrated, disable reserve-based actions until reserves are re-seeded and accounting is reinitialized atomically.
 
 ```rust
 // After transferring all assets out:
@@ -537,6 +554,28 @@ entity.secondary_status = entity
     .unwrap_or(SecondaryStatus::Open);
 ```
 
+### 26.6 Paired Time Gates Must Share One Deadline Source
+- When one lifecycle timestamp controls two opposite permissions (for example, **action allowed until deadline** and **cleanup allowed after deadline**), compute one canonical `deadline_ts` and reuse it everywhere.
+- Never duplicate time-gate math inline across handlers. Divergent inequality direction, stale assumptions, or sentinel handling can invert intended permissions and violate lifecycle guarantees.
+- If an "immediate", "no grace", or special mode exists, model it with an explicit enum/flag and dedicated branching. Do not overload timestamp fields with magic values.
+
+```rust
+let deadline_ts = event_ts.checked_add(grace_period).ok_or(ErrorCode::Arithmetic)?;
+let can_action = now <= deadline_ts;
+let can_finalize = now > deadline_ts;
+```
+
+### 26.7 Terminal States Must Be Absorbing (Non-Rewritable)
+- Treat terminal states as **absorbing nodes** in the state machine: once entered, they cannot transition to non-terminal states by default.
+- Enforce transitions from a single canonical transition matrix (or helper), and validate `(current_state, next_state)` before any side effects.
+- Access control is not a substitute for transition validation. An authorized actor can still perform an invalid lifecycle rewrite if transition guards are permissive.
+- Avoid exclusion-style predicates (`state != X`). Use explicit allowlists of valid source states per instruction.
+- If a recovery path is intentionally supported, model it as a distinct transition with strict preconditions and explicit audit-trail events.
+
+```rust
+require!(is_allowed_transition(current_state, next_state), ErrorCode::InvalidTransition);
+```
+
 ---
 
 ## 27. SLIPPAGE & FEE ORDERING
@@ -544,6 +583,7 @@ entity.secondary_status = entity
 ### 27.1 Slippage Guards Must Protect Net Amount, Not Gross
 - If fees are deducted from user proceeds (or added to user cost), slippage validation must compare against net user outcome.
 - Checking only gross AMM output can pass while user receives less than `min_output`.
+- Keep API/event naming unambiguous (`gross_out`, `fee_amount`, `net_out`) so clients cannot misinterpret slippage-protected values.
 
 ```rust
 // WRONG — checks gross
@@ -593,6 +633,7 @@ treasury.lamports += fee;
 ### 28.1 Cap Purchases at the Completion Threshold
 - If a curve has a completion threshold, clamp buys so sold amount never exceeds remaining capacity.
 - Overshoot can consume reserves needed for downstream actions (LP seeding, withdrawals, fees), causing reverts or underflows.
+- After applying any cap/clip to execution size, recompute outputs and re-check user slippage bounds against the **actual executed output**. Input-side limits alone do not protect output guarantees.
 
 ```rust
 let sold_so_far = total_supply - remaining_reserves;
@@ -605,6 +646,7 @@ let effective_buy = std::cmp::min(requested_amount, remaining_capacity);
 - In virtual/real reserve models, subtraction must align with the layer used for output math.
 - If output uses `virtual + real` but subtraction only hits `real`, underflow is possible.
 - Either cap output at `real_reserves` or subtract from both reserve layers consistently.
+- When executable balance and restricted balance share one pool, enforce explicit spendable-balance bounds (`output <= spendable_balance`) and never consume restricted allocations.
 
 ### 28.3 Validate Interdependent Config Fields Against Each Other, Not Stale State
 - For multi-field config updates, validate all new values against each other before writing state.
@@ -649,10 +691,25 @@ require!(
 - Mutable global config values read at execution time can brick already-live entities.
 - Example: cancellation fee greater than deposit causes refund underflow.
 - Either snapshot critical economics per entity at creation, or enforce config invariants on every update.
+- Validate parameter bounds in **every write path** (initialize, update, and migration/setup helpers). Never assume checks in one entrypoint protect all others.
+- When global parameters are snapshotted into per-entity state, validate at snapshot time too. Invalid captured values can permanently break that entity even after global settings are fixed.
+- Enforce both per-field domains and cross-field invariants before persisting any config change.
+- For fixed-total reserve/accounting models, enforce `sum(parts) <= total` and compute derived remainder fields with checked arithmetic (`checked_add`/`checked_sub`) to prevent wraparound-built invalid states.
+- For safety-critical economic/control parameters, enforce non-degenerate lower bounds (not just upper bounds). Zero or near-zero values can create pathological behavior and permanently poison newly snapshotted entities.
 
 ```rust
 require!(config.cancel_fee <= config.min_deposit, "fee would brick refunds");
 require!(config.completion_fee < config.completion_threshold, "fee exceeds threshold");
+```
+
+### 29.4 Config Update APIs Must Preserve "No Change" Semantics
+- Partial config updates need tri-state behavior per field: **unchanged**, **set to value**, and (if supported) **explicitly clear**.
+- Never overload a single `Option<T>` parameter to mean both "not provided" and "clear the stored optional field." This causes silent config corruption on unrelated updates.
+- For optional stored fields, use an explicit patch enum or separate `clear_*` flags so callers can update one field without mutating others.
+- Keep semantics uniform across all fields in the same admin update instruction.
+
+```rust
+enum Patch<T> { Unchanged, Set(T), Clear }
 ```
 
 ---
@@ -661,9 +718,12 @@ require!(config.completion_fee < config.completion_threshold, "fee exceeds thres
 
 ### 30.1 Withdrawal Amount Must Be Validated Against Protocol Allocation
 - If admin/user-supplied withdraw amounts are not capped by tracked allocation, over-withdrawal can steal assets reserved for other flows.
+- Withdrawal eligibility must also require that all earmarked liabilities are settled (pending payouts, rebates, escrowed distributions, accrued obligations). Do not permit residual-balance extraction while reserved liability fields remain nonzero.
+- Reconcile liabilities to their intended recipients before any residual transfer.
 
 ```rust
 require!(withdraw_amount <= state.allocated_fee_balance, "exceeds allocated amount");
+require!(state.pending_liabilities == 0, "unsettled obligations");
 ```
 
 ### 30.2 Zero Accounting Fields After Completing a Drain
