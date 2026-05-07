@@ -107,6 +107,7 @@ let mut data = account.try_borrow_mut_data()?;  // mutable borrow for writing
 ## 3. PDA DERIVATION — NATIVE RUST
 
 ### 3.1 Find and Store Canonical Bump at Init Time
+- On initialization, derive the expected PDA on-chain and verify the client-supplied account matches it before creating or writing any state.
 ```rust
 // At initialization
 let (vault_pda, bump) = Pubkey::find_program_address(
@@ -180,6 +181,7 @@ let updated_vault = Vault::try_from_slice(&vault_data)?;
 ```
 - Unlike Anchor's `.reload()`, in native Rust you must manually re-borrow and re-deserialize the account data after a CPI.
 - Never use a local variable that was deserialized before the CPI to make decisions after the CPI.
+- After CPI, any cached assumptions about externally touched accounts may be stale. Re-read data and revalidate any invariants you still depend on before continuing.
 
 ---
 
@@ -273,6 +275,10 @@ impl From<MyError> for ProgramError {
 ### 7.2 Never Panic in Production Code
 - `unwrap()` and `expect()` are banned in instruction handlers — they crash the entire program.
 - Use `?`, `ok_or()`, `unwrap_or_else()`, or explicit match patterns everywhere.
+
+### 7.3 Logging Discipline
+- Logging raw account metadata is useful for learning and debugging, but production code should avoid leaking unnecessary operational details.
+- Keep logs minimal, purposeful, and safe to expose in public transaction traces.
 
 ---
 
